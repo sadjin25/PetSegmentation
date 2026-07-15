@@ -6,12 +6,13 @@ import torch.optim as optim
 import cv2
 import glob
 import os
+from tqdm import tqdm
 
 IMG_PATH = "./Datas/images/images/"
 MASK_PATH = "./Datas/annotations/trimaps/"
 IMG_SIZE = (384, 384)
 EPOCH_SIZE = 5
-TRAIN_BATCH_SIZE = 2
+TRAIN_BATCH_SIZE = 4
 TRAINED_DATA_PATH = "./Datas/trained_data/pet_seg.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else 'cpu')
 
@@ -50,8 +51,8 @@ class PetImages_Dataset(Dataset):
         if mask is None:
             raise RuntimeError(f"Failed to read mask: {mask_each_path}")
 
-        mask = (mask != 2)
         mask = GetResizedImage(mask, isMask=True)
+        mask = (mask != 2)
         mask = torch.from_numpy(mask).unsqueeze(0).float() #img와 형 일치
 
         return img, mask
@@ -151,20 +152,35 @@ if __name__ == "__main__":
     model.to(DEVICE)
 
     train_dataset = PetImages_Dataset()
-    train_dataloader = DataLoader(train_dataset, batch_size = TRAIN_BATCH_SIZE, shuffle=False, num_workers=0)
+    train_dataloader = DataLoader(train_dataset, batch_size = TRAIN_BATCH_SIZE, 
+                                  shuffle=True, num_workers=4, persistent_workers=True,
+                                  pin_memory=(DEVICE.type == "cuda"))
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     model.train()
     for epoch in range(EPOCH_SIZE):
-        for imgs, masks in train_dataloader:
-            imgs = imgs.to(DEVICE) # [B 3 H W]
-            masks = masks.to(DEVICE) # [B 1 H W]
+        running_loss = 0.0
+        progress_bar = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch + 1}/{EPOCH_SIZE}",
+            unit="batch"
+        )
+
+        for step, (imgs, masks) in enumerate(progress_bar, start=1):
+            imgs = imgs.to(DEVICE, non_blocking=True) # [B 3 H W]
+            masks = masks.to(DEVICE, non_blocking=True) # [B 1 H W]
             optimizer.zero_grad()
 
             output = model(imgs)
             loss = criterion(output, masks)
             loss.backward()
             optimizer.step()
+
+            running_loss += loss.item()
+            progress_bar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                avg_loss=f"{running_loss / step:.4f}"
+            )
 
     torch.save(model.state_dict(), TRAINED_DATA_PATH)
