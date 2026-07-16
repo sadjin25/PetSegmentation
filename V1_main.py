@@ -16,6 +16,10 @@ TRAIN_BATCH_SIZE = 4
 TRAINED_DATA_PATH = "./Datas/trained_data/pet_seg.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else 'cpu')
 
+TEST_BATCH_SIZE = 4
+TEST_SEED = 245
+
+
 def GetResizedImage(img, isMask=False):
     if(isMask is True) :
         paddedImg = cv2.resize(img, IMG_SIZE, interpolation=cv2.INTER_NEAREST)
@@ -145,11 +149,9 @@ class PetSegModel(nn.Module):
         x = self.out_conv(x)
 
         return x
-    
 
-if __name__ == "__main__":
-    model = PetSegModel()
-    model.to(DEVICE)
+def DoTrain(model):
+    model.train()
 
     train_dataset = PetImages_Dataset()
     train_dataloader = DataLoader(train_dataset, batch_size = TRAIN_BATCH_SIZE, 
@@ -158,7 +160,6 @@ if __name__ == "__main__":
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    model.train()
     for epoch in range(EPOCH_SIZE):
         running_loss = 0.0
         progress_bar = tqdm(
@@ -184,3 +185,68 @@ if __name__ == "__main__":
             )
 
     torch.save(model.state_dict(), TRAINED_DATA_PATH)
+
+@torch.no_grad()
+def DoTest(model):
+    torch.manual_seed(TEST_SEED)
+    torch.cuda.manual_seed_all(TEST_SEED)
+    g = torch.Generator()
+    g.manual_seed(TEST_SEED)
+
+    model.load_state_dict(torch.load(TRAINED_DATA_PATH, map_location=DEVICE))
+    model.eval()
+    criterion = nn.BCEWithLogitsLoss()
+
+    test_dataset = PetImages_Dataset()
+    test_dataloader = DataLoader(test_dataset, batch_size=TEST_BATCH_SIZE, 
+                                    shuffle=False, num_workers=4, persistent_workers=True,
+                                    pin_memory=(DEVICE.type == "cuda"))
+
+    total_loss = 0.0
+    pet_miou = 0.0
+    dice = 0.0
+    total_imgs = 0
+
+    for imgs, masks in tqdm(test_dataloader, desc="Test", unit="batch"):
+        imgs = imgs.to(DEVICE, non_blocking=True)
+        masks = masks.to(DEVICE, non_blocking=True)
+        total_imgs += imgs.size(0)
+
+        logits = model(imgs)
+        loss = criterion(logits, masks)
+        total_loss += loss.item() * imgs.size(0) # BCEWithLogitsLoss() returns meanloss over batch.
+
+        preds = (torch.sigmoid(logits) >= 0.5).long()
+        masks = masks.long()
+
+        intersection_per_img = (preds & masks).sum(dim=(1,2,3)) # [B]
+        union_per_img = (preds | masks).sum(dim=(1,2,3)) # [B]
+        
+        iou_per_img = intersection_per_img / union_per_img.clamp_min(1) # [B]
+        pet_miou += iou_per_img.sum().item()
+    
+        # shape for dice cal : [B]
+        dice_intersection = (preds & masks).sum(dim=(1,2,3)) # [B,1,H,W]
+        dice_denominator = preds.sum(dim=(1,2,3)) + masks.sum(dim=(1,2,3)) # [B,1,H,W]
+        dice_batch = ((2 * dice_intersection + 1e-5) / (dice_denominator + 1e-5))
+
+        dice += dice_batch.sum().item()
+
+    print(f"Test Loss: {total_loss / total_imgs:.4f}")
+    print(f"Mean Pet IoU : {pet_miou / total_imgs:.4f}")
+    print(f"Mean Dice : {dice / total_imgs:.4f}")
+
+# MAIN---------------------
+
+if __name__ == "__main__":
+    model = PetSegModel()
+    model.to(DEVICE)
+
+# TRAIN
+    # DoTrain(model)
+
+# TEST
+    DoTest(model)
+
+
+
